@@ -15,7 +15,9 @@ from cdifflib import CSequenceMatcher
 from collections import defaultdict
 import asyncio
 import aiohttp
+import sys
 import traceback
+import logging
 import multiprocessing
 from multiprocessing.pool import ThreadPool
 try:
@@ -103,7 +105,7 @@ def form_score(form):
     for x in inputs:
         type_ = x.get_property('type') if isinstance(x, webdriver.remote.webelement.WebElement) else "other"
         typecount[type_] += 1
-    print(f'{typecount}')
+    logger.debug(f'{typecount}')
     if typecount['text'] in [1, 2]:
         score += 10
     if not typecount['text']:
@@ -121,7 +123,7 @@ def form_score(form):
 
 def pick_form(driver):
     """Return the form most likely to be a login form"""
-    forms = driver.fin_elements_by_xpath('//form')
+    forms = driver.find_elements_by_xpath('//form')
     return sorted(forms, key=form_score, reverse=True)[0]
 
 
@@ -172,16 +174,17 @@ def get_form_objects(driver):
     
 
 def is_login_page(driver, url):
-    answer = {'scheme': None}
+    answer = {'url': url, 
+            'scheme': None}
     response = requests.get(url)
     if 'www-authenticate' in response.headers.keys():
-        answer['scheme'] = 'basic_auth'
-        answer['url'] = url
-        return answer
+        if response.headers['www-authenticate'].startswith("Basic "): 
+            answer['scheme'] = 'basic_auth'
+            return answer
     driver.get(url)
     source = driver.page_source
     score, form = page_score(driver)
-    print(f"[i] Score: {score}")
+    logger.debug(f"[i] Score: {score}")
     if score >= 20:
         answer['scheme'] = 'form'
         username_input, password_input, click_button = pick_fields(form)
@@ -235,7 +238,7 @@ def test_creds_basic_auth(url, credentials, validation_test=None):
             tasks.append(loop.create_task(async_test_cred(url, username, password, semaphore, success)))
         waiter_worker = loop.create_task(cleaner(success, tasks)) 
         results = loop.run_until_complete(gather_tasks(tasks))
-        #print(f'results: {results}')
+        logger.debug(f'results: {results}')
         to_return = [ obj for obj in results if obj is not None ]
         success.set()
         return to_return
@@ -257,7 +260,6 @@ def test_cred_form(url, username, password, host, port):
         driver.get(url)
         initial_page = driver.page_source
         username_input, password_input, click_button = get_form_objects(driver) 
-        #print("[+] {0}:{1}".format(username, password))
         username_input.clear()
         username_input.send_keys(username)
         password_input.clear()
@@ -265,13 +267,15 @@ def test_cred_form(url, username, password, host, port):
         click_button.click()
         sleep(3)
         m = CSequenceMatcher(None, initial_page, driver.page_source)
-        #print(f'ratio: {m.ratio()}')
-        if m.ratio() < 0.7:
+        logger.debug(f"{username}:{password} ratio: {m.ratio()}")
+        if m.ratio() < 0.8:
             return [{'ratio': m.ratio(),
                     'username': username,
                     'password': password
                     }]
         return None
+    except Exception as e:
+        logger.error(e)
     finally:
         if driver is not None:
             driver.close()
@@ -289,10 +293,12 @@ def test_creds_form(url, credentials, host, port):
     '''
     class Executor:
         def __init__(self, thread_num):
+            self.results = None
             self.pool = ThreadPool(thread_num)
 
         def finished_form_test(self, result):
             if result is not None:
+                self.results = result
                 self.pool.terminate()
 
         def schedule(self, function, args):
@@ -312,24 +318,35 @@ def test_creds_form(url, credentials, host, port):
             executor.schedule(test_cred_form, 
                     args=(url, username, password, host, port, ))
         executor.wait()
+        result = None
+        if executor.results is not None:
+            result = [res for res in executor.results if res is not None]    
+        return result
     except:
         if executor is not None:
             executor.terminate()
         traceback.print_exc()
 
-def analyze_url(url, credentials, host, port): 
+def analyze_url(url, credentials_file, host, port): 
     try:
+        with open(credentials_file, 'r') as f:
+            creds = f.readlines()
+        credentials = []
+        for cred in creds:
+            username, password = cred.strip("\n").split(':')
+            credentials.append({"username": username, "password": password})
         driver = get_new_selenium_driver(host, port)
         answer = is_login_page(driver, url)
-        #print(answer)
+        logger.debug(answer)
         if answer['scheme'] == 'form':
             print(f'[+] [{url}] Form login page detected')
-            result = test_creds_form(answer['objects'], credentials, host, port)
+            result = test_creds_form(answer['url'], credentials, host, port)
         elif answer['scheme'] == 'basic_auth':
             print(f'[+] [{url}] Basic auth protected page detected')
             result = test_creds_basic_auth(answer['url'], credentials)
         else:
             return None
+        logger.debug(result)
         if result:
             creds = ""
             for cred in result:
@@ -345,12 +362,19 @@ if __name__ == "__main__":
     parser.add_argument('-u', '--url', help="URL of target authentication page", required=True)
     parser.add_argument('--host', help="Selenium host", required=True)
     parser.add_argument('-p', '--port', help="Selenium port", required=True)
+    parser.add_argument('-c', '--credentials', help="Credential list. username:password format, one by line", required=True)
     args = parser.parse_args()
     url = args.url
     host = args.host
     port = args.port
-    credentials = [{'username': 'admin', 'password': 'admin'},
-            {'username': 'tomcat', 'password': 's3cret'}]
+    credentials = args.credentials
+    logger = logging.getLogger('credscheckr')
+    logger.setLevel(logging.WARNING)
+    sh = logging.StreamHandler(sys.stdout)
+    formatter = logging.Formatter(
+            '[%(asctime)s][%(module)s][%(funcName)s][%(levelname)s] %(message)s')
+    sh.setFormatter(formatter)
+    logger.addHandler(sh)
     try:
         driver = selenium_start() 
         analyze_url(url, credentials, host, port)

@@ -4,3 +4,4 @@ selenium
 cdifflib
 aiohttp
 requests
+traceback
